@@ -1,0 +1,90 @@
+name: Implantar VIO na Azure
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions: {}
+
+concurrency:
+  group: vio-deploy-azure
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Implantar a versão da tag e validar a API
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          VM_APP_DIR: ${{ secrets.VM_APP_DIR }}
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+          VM_KNOWN_HOSTS: ${{ secrets.VM_KNOWN_HOSTS }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          EXPECTED_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Confere os valores antes de montar o comando remoto.
+          : "${VM_SSH_KEY:?Cadastre VM_SSH_KEY}"
+          : "${VM_KNOWN_HOSTS:?Cadastre VM_KNOWN_HOSTS}"
+          [[ "$VM_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$VM_USER" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]]
+          [[ "$VM_APP_DIR" =~ ^/[a-zA-Z0-9_./-]+$ ]]
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+          # Guarda as chaves em arquivos temporários do runner.
+          umask 077
+          ssh_dir=$(mktemp -d)
+          trap 'rm -rf -- "$ssh_dir"' EXIT
+          printf '%s\n' "$VM_SSH_KEY" | tr -d '\r' > "$ssh_dir/deploy_key"
+          printf '%s\n' "$VM_KNOWN_HOSTS" | tr -d '\r' > "$ssh_dir/known_hosts"
+
+          ssh -T -i "$ssh_dir/deploy_key" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes -o HostKeyAlgorithms=ssh-ed25519 \
+            -o UserKnownHostsFile="$ssh_dir/known_hosts" \
+            "$VM_USER@$VM_HOST" \
+            "bash -s -- '$VM_APP_DIR' '$RELEASE_TAG' '$EXPECTED_SHA'" <<'DEPLOY'
+          set -euo pipefail
+          app_dir=$1
+          tag=$2
+          expected_sha=$3
+          cd "$app_dir"
+
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo 'Há mudanças no clone da VM. Revise-as antes do deploy.' >&2
+            exit 1
+          fi
+
+          # Busca a tag e confirma o commit associado a ela.
+          export GIT_TERMINAL_PROMPT=0
+          git fetch --no-tags origin "refs/tags/$tag"
+          tag_object=$(git rev-parse FETCH_HEAD)
+          commit=$(git rev-parse 'FETCH_HEAD^{commit}')
+          if [[ "$expected_sha" != "$tag_object" && "$expected_sha" != "$commit" ]]; then
+            echo 'A tag no repositório não corresponde à versão do evento.' >&2
+            exit 1
+          fi
+          git switch --detach "$commit"
+          printf 'Implantando %s no commit %s\n' "$tag" "$commit"
+
+          # Constrói as imagens e inicia o backend antes do Nginx.
+          sudo -n docker compose config --quiet
+          sudo -n docker compose build
+          sudo -n docker compose up -d --no-build --wait --wait-timeout 60 backend
+          sudo -n docker compose up -d --no-build --force-recreate --wait --wait-timeout 60 frontend
+          sudo -n docker compose ps
+
+          # Confirma que a API responde pela porta HTTP do Nginx.
+          resposta=$(curl -fsS --max-time 5 --retry 5 --retry-delay 2 \
+            --retry-all-errors http://127.0.0.1/api/status)
+          printf '%s\n' "$resposta"
+          grep -Eq '"status"[[:space:]]*:[[:space:]]*"online"' <<< "$resposta"
+          DEPLOY
