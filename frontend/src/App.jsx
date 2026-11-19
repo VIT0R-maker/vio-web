@@ -103,6 +103,10 @@ function App() {
       <header className="cabecalho">
         <h1>VIO WEB</h1>
         <p>Venda de Ingressos Online</p>
+        <p>
+          Vitor Faccini da Cruz Morais — 4º DSM (Desenvolvimento de Software
+          Multiplataforma)
+        </p>
       </header>
 
       <main className="conteudo">
